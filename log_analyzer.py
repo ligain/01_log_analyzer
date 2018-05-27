@@ -5,9 +5,11 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import logging
 import fnmatch
 import gzip
+
 from datetime import date
 from logging.config import dictConfig
 
@@ -21,6 +23,7 @@ DEFAULT_CONFIG = {
     'REPORT_SIZE': 1000,
     'REPORT_DIR': './reports',
     'LOG_DIR': './logs',
+    'LOG_FILE_TMP': 'nginx-access-ui.log-{today_stamp}.*',
     'LOGGER_CONF': {
         'version': 1,
         'formatters': {
@@ -34,7 +37,7 @@ DEFAULT_CONFIG = {
                 'level': 'INFO',
                 'formatter': 'default',
                 'class': 'logging.handlers.RotatingFileHandler',
-                'filename': 'log_analyzer.log',
+                'filename': 'log_analyzer.log'
             }
         },
         'loggers': {
@@ -43,30 +46,82 @@ DEFAULT_CONFIG = {
                 'handlers': ['file']
             }
         }
-    }
+    },
+    'REPORT_FILE_TMP': 'report-{year}.{month}.{day}.html',
+    'LOG_LINE_PATTERN': r'(?P<remote_addr>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+'
+                        r'(?P<remote_user>[\w\-]+)\s+'
+                        r'(?P<http_x_real_ip>[\w\-]+)\s+\['
+                        r'(?P<time_local>.+)\]\s+\"'
+                        r'(?P<request_method>\w+)\s+'
+                        r'(?P<request_url>.+?)\s'
+                        r'(?P<request_protocol>.+?)\"\s+'
+                        r'(?P<status>\d{3})\s+'
+                        r'(?P<body_bytes_sent>\d+)\s+\"'
+                        r'(?P<http_referer>.+?)\"\s+\"'
+                        r'(?P<http_user_agent>.+?)\"\s+\"'
+                        r'(?P<http_x_forwarded_for>[\w\-]+)\"\s+\"'
+                        r'(?P<http_x_request_id>.+?)\"\s+\"'
+                        r'(?P<http_x_rb_user>.+?)\"\s'
+                        r'(?P<request_time>[\d\.]+)$',
+    'PARSE_ERR_THRESHOLD': 0.3
 }
 
 
-def get_log_filepath(logs_dir='../logs', log_filename_tmp='nginx-access-ui.log-{today_stamp}.*'):
+def get_log_filepath(logs_dir, log_filename_tmp):
     logs_in_dir = os.listdir(logs_dir)
     today_stamp = date.today().strftime('%Y%m%d')
     today_log_filename = log_filename_tmp.format(today_stamp=today_stamp)
     found_logs = fnmatch.filter(logs_in_dir, today_log_filename)
-    return found_logs[0] if found_logs else None
+    if found_logs:
+        log_filepath = os.path.join(logs_dir, found_logs[0])
+    else:
+        log_filepath = None
+    return log_filepath
 
 
 def read_log(log_filepath):
+    """
+    Определяет является ли логфайл по адресу `log_filepath`
+    простым текстовым или зархивирован и затем читает его построчно
+    """
     log_filetype, log_encoding = mimetypes.guess_type(log_filepath)
 
     if log_filetype == 'text/plain':
         log_fileobj = open(log_filepath)
     elif log_encoding == 'gzip':
-        log_fileobj = gzip.GzipFile(log_filepath)
+        log_fileobj = gzip.open(log_filepath, 'rt')
     else:
         return
     for log_line in log_fileobj:
         yield log_line
     log_fileobj.close()
+
+
+def check_parse_errors(parsed_lines_count, parse_error_count, error_threshold):
+    return True
+
+
+def process_log_lines(lines, line_pattern, log=None, error_threshold=0.0):
+    logger = log if log else logging
+    parse_error_count = 0
+    compiled_pattern = re.compile(line_pattern)
+
+    for line_number, line in enumerate(lines):
+
+        if not check_parse_errors(line_number,
+                                  parse_error_count, error_threshold):
+            log.error('Too much parse errors: %d', parse_error_count)
+            break
+
+        if line:
+            match = compiled_pattern.search(line)
+            if match:
+                yield match.groupdict()
+            else:
+                parse_error_count += 1
+                logger.info('Skip unmatched log string: %s', line)
+        else:
+            logger.info('Skip empty line on position: %d', line_number)
 
 
 def is_filepath(path):
@@ -79,7 +134,7 @@ def is_filepath(path):
 
 def get_args():
     parser = argparse.ArgumentParser(
-        description='Nginx log parser and analyzer'
+        description='Custom nginx log parser and analyzer'
     )
     parser.add_argument(
         '-c', '--config',
@@ -107,25 +162,38 @@ def get_config(config_filepath, default_config={}):
     return result_config
 
 
-def main(args, log=None, config=None):
+def main(log=None, config=None):
     logger = log if log else logging
 
     if config is None:
         logger.error('Config was not found. Terminating script...')
         return
 
-    log_filepath = get_log_filepath()
-    logger.info('log_filepath: %s', log_filepath)
-    # print(log_filepath)
+    logger.info("Looking for logs in directory: %s", config['LOG_DIR'])
+    log_filepath = get_log_filepath(
+        logs_dir=config['LOG_DIR'],
+        log_filename_tmp=config['LOG_FILE_TMP']
+    )
+    if not log_filepath:
+        logger.error("There are not today's logs "
+                     "in directory: %s", config['LOG_DIR'])
+        return
 
-    # if not log_filepath:
-    #     print("No log files was found.")
-    #     return
-    #
-    # print('log_filepath: ', log_filepath)
-    # logfile = read_logfile(log_filepath)
-    # for line in logfile:
-    #     print(line)
+    logger.info('Trying to open logfile: %s', log_filepath)
+    log_lines = read_log(log_filepath)
+
+    logger.info('Parsing log lines')
+    parsed_lines = process_log_lines(
+        log_lines,
+        line_pattern=config['LOG_LINE_PATTERN'],
+        log=logger,
+        error_threshold=config['PARSE_ERR_THRESHOLD']
+    )
+
+    for parsed_line in parsed_lines:
+        print(parsed_line)
+
+    logger.info('Done!')
 
 
 if __name__ == '__main__':
@@ -145,6 +213,6 @@ if __name__ == '__main__':
              'config: %s and initial params: %s', config, vars(args))
 
     try:
-        main(args, log=log, config=config)
+        main(log=log, config=config)
     except BaseException:
         log.exception('Critical error. Terminating script...')

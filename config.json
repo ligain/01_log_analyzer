@@ -1,0 +1,33 @@
+{
+    "REPORT_SIZE": 500,
+    "REPORT_DIR": "./reports",
+    "LOG_DIR": "../logs",
+    "LOGGER_CONF": {
+        "version": 1,
+        "formatters": {
+            "default": {
+                "format": "[%(asctime)s] %(levelname).1s %(message)s",
+                "datefmt": "%Y.%m.%d %H:%M:%S"
+            }
+        },
+        "handlers": {
+            "file": {
+                "level": "INFO",
+                "formatter": "default",
+                "class": "logging.handlers.RotatingFileHandler",
+                "filename": "log_analyzer.log"
+            },
+            "console": {
+                "level": "INFO",
+                "formatter": "default",
+                "class": "logging.StreamHandler"
+            }
+        },
+        "loggers": {
+            "default": {
+                "level": "INFO",
+                "handlers": ["console", "file"]
+            }
+        }
+    }
+}

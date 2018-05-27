@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import functools
 import json
 import mimetypes
 import os
@@ -9,9 +10,12 @@ import re
 import logging
 import fnmatch
 import gzip
+import statistics
 
 from datetime import date
 from logging.config import dictConfig
+from itertools import groupby
+from operator import itemgetter
 
 
 # log_format ui_short '$remote_addr $remote_user $http_x_real_ip [$time_local] "$request" '
@@ -48,6 +52,7 @@ DEFAULT_CONFIG = {
         }
     },
     'REPORT_FILE_TMP': 'report-{year}.{month}.{day}.html',
+    'REPORT_TMP_NAME': 'report.html',
     'LOG_LINE_PATTERN': r'(?P<remote_addr>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+'
                         r'(?P<remote_user>[\w\-]+)\s+'
                         r'(?P<http_x_real_ip>[\w\-]+)\s+\['
@@ -67,10 +72,8 @@ DEFAULT_CONFIG = {
 }
 
 
-def get_log_filepath(logs_dir, log_filename_tmp):
+def get_log_filepath(logs_dir, today_log_filename):
     logs_in_dir = os.listdir(logs_dir)
-    today_stamp = date.today().strftime('%Y%m%d')
-    today_log_filename = log_filename_tmp.format(today_stamp=today_stamp)
     found_logs = fnmatch.filter(logs_in_dir, today_log_filename)
     if found_logs:
         log_filepath = os.path.join(logs_dir, found_logs[0])
@@ -98,7 +101,15 @@ def read_log(log_filepath):
 
 
 def check_parse_errors(parsed_lines_count, parse_error_count, error_threshold):
-    return True
+    """
+    Определяет превышает ли количество ошибок парсинга некий порог.
+    Если да, то выдает False, что сигнализирует об остановке парсинга.
+    """
+    try:
+        errors_percent = parse_error_count / parsed_lines_count
+    except ZeroDivisionError:
+        errors_percent = 0
+    return True if errors_percent < error_threshold else False
 
 
 def process_log_lines(lines, line_pattern, log=None, error_threshold=0.0):
@@ -124,6 +135,48 @@ def process_log_lines(lines, line_pattern, log=None, error_threshold=0.0):
             logger.info('Skip empty line on position: %d', line_number)
 
 
+def count_statistics(parsed_lines: list, report_size=500):
+    total_lines_count = len(parsed_lines)
+    total_request_time = functools.reduce(
+        lambda total, line: total + float(line.get('request_time', 0.0)),
+        parsed_lines,
+        0.0
+    )
+    result = []
+    for url, line in groupby(parsed_lines, key=itemgetter('request_url')):
+        items = list(line)
+        lines_count = len(items)
+        url_request_time_list = [float(line.get('request_time', 0.0)) 
+                                 for line in items]
+        time_sum = sum(url_request_time_list)
+        result.append({
+            'url': url,
+            'count': lines_count,
+            'count_perc': lines_count / total_lines_count,
+            'time_sum': time_sum,
+            'time_max': max(
+                items,
+                key=lambda line: float(line.get('request_time', 0.0))
+            ).get('request_time', 0.0),
+            'time_avg': statistics.mean(url_request_time_list),
+            'time_med': statistics.median(url_request_time_list),
+            'time_perc': time_sum / total_request_time
+        })
+    return sorted(result, key=itemgetter('time_avg'),
+                  reverse=True)[:report_size]
+
+
+def generate_and_save_report(report_data, template_report_fullpath,
+                             today_report_fullpath):
+    table_json = json.dumps(report_data)
+    with open(template_report_fullpath) as template_report_fileobj:
+        template_report_text = template_report_fileobj.read()
+    generated_report_text = template_report_text.replace('$table_json',
+                                                         table_json)
+    with open(today_report_fullpath, 'w') as generated_report_fileobj:
+        generated_report_fileobj.write(generated_report_text)
+
+
 def is_filepath(path):
     if not os.path.isfile(path):
         raise argparse.ArgumentTypeError(
@@ -146,6 +199,10 @@ def get_args():
 
 
 def get_config(config_filepath, default_config={}):
+    """
+    Считывает json данные с конфигурационного файла, который
+    указан в `config_filepath`
+    """
 
     with open(config_filepath) as config_file:
         try:
@@ -169,10 +226,27 @@ def main(log=None, config=None):
         logger.error('Config was not found. Terminating script...')
         return
 
+    logger.info('Searching for generated report '
+                'in directory: %s', config['REPORT_DIR'])
+    today = date.today()
+    today_report_filename = config['REPORT_FILE_TMP'].format(
+        year=today.year, month=today.month, day=today.day)
+    today_report_fullpath = os.path.join(config['REPORT_DIR'],
+                                         today_report_filename)
+    is_report_generated = os.path.isfile(today_report_fullpath)
+    if is_report_generated:
+        logger.info('We have generated '
+                    'a report today: %s', today_report_fullpath)
+        return
+    else:
+        logger.info("No today's reports was found. Continue...")
+
     logger.info("Looking for logs in directory: %s", config['LOG_DIR'])
+    today_stamp = today.strftime('%Y%m%d')
+    today_log_filename = config['LOG_FILE_TMP'].format(today_stamp=today_stamp)
     log_filepath = get_log_filepath(
         logs_dir=config['LOG_DIR'],
-        log_filename_tmp=config['LOG_FILE_TMP']
+        today_log_filename=today_log_filename
     )
     if not log_filepath:
         logger.error("There are not today's logs "
@@ -190,8 +264,19 @@ def main(log=None, config=None):
         error_threshold=config['PARSE_ERR_THRESHOLD']
     )
 
-    for parsed_line in parsed_lines:
-        print(parsed_line)
+    logger.info('Calculating statistics for log lines')
+    lines_statistics = count_statistics(list(parsed_lines),
+                                        config['REPORT_SIZE'])
+
+    logger.info('Generate and save report '
+                'in folder: %s', config['REPORT_DIR'])
+    template_report_fullpath = os.path.join(config['REPORT_DIR'],
+                                            config['REPORT_TMP_NAME'])
+    generate_and_save_report(
+        report_data=lines_statistics,
+        template_report_fullpath=template_report_fullpath,
+        today_report_fullpath=today_report_fullpath
+    )
 
     logger.info('Done!')
 

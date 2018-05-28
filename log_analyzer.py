@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import argparse
@@ -17,11 +17,17 @@ from logging.config import dictConfig
 from itertools import groupby
 from operator import itemgetter
 
+"""
+Log analyzer for custom nginx logs.
 
-# log_format ui_short '$remote_addr $remote_user $http_x_real_ip [$time_local] "$request" '
-#                     '$status $body_bytes_sent "$http_referer" '
-#                     '"$http_user_agent" "$http_x_forwarded_for" "$http_X_REQUEST_ID" "$http_X_RB_USER" '
-#                     '$request_time';
+To run:
+$ python3 log_analyzer.py --config path/to/config.json
+
+config.json - should be a configuration json file 
+like `DEFAULT_CONFIG` constant.
+
+"""
+
 
 DEFAULT_CONFIG = {
     'REPORT_SIZE': 1000,
@@ -52,28 +58,18 @@ DEFAULT_CONFIG = {
         }
     },
     'REPORT_FILE_TMP': 'report-{year}.{month}.{day}.html',
-    'REPORT_TMP_NAME': 'report.html',
-    'LOG_LINE_PATTERN': r'(?P<remote_addr>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+'
-                        r'(?P<remote_user>[\w\-]+)\s+'
-                        r'(?P<http_x_real_ip>[\w\-]+)\s+\['
-                        r'(?P<time_local>.+)\]\s+\"'
-                        r'(?P<request_method>\w+)\s+'
-                        r'(?P<request_url>.+?)\s'
-                        r'(?P<request_protocol>.+?)\"\s+'
-                        r'(?P<status>\d{3})\s+'
-                        r'(?P<body_bytes_sent>\d+)\s+\"'
-                        r'(?P<http_referer>.+?)\"\s+\"'
-                        r'(?P<http_user_agent>.+?)\"\s+\"'
-                        r'(?P<http_x_forwarded_for>[\w\-]+)\"\s+\"'
-                        r'(?P<http_x_request_id>.+?)\"\s+\"'
-                        r'(?P<http_x_rb_user>.+?)\"\s'
+    'REPORT_TMP_NAME': 'report_template.html',
+    'LOG_LINE_PATTERN': r'.+\]\s+\"\w+\s+(?P<request_url>.+?)\s.+?\s'
                         r'(?P<request_time>[\d\.]+)$',
     'PARSE_ERR_THRESHOLD': 0.3
 }
 
 
 def get_log_filepath(logs_dir, today_log_filename):
-    logs_in_dir = os.listdir(logs_dir)
+    try:
+        logs_in_dir = os.listdir(logs_dir)
+    except FileNotFoundError:
+        return
     found_logs = fnmatch.filter(logs_in_dir, today_log_filename)
     if found_logs:
         log_filepath = os.path.join(logs_dir, found_logs[0])
@@ -84,8 +80,8 @@ def get_log_filepath(logs_dir, today_log_filename):
 
 def read_log(log_filepath):
     """
-    Определяет является ли логфайл по адресу `log_filepath`
-    простым текстовым или зархивирован и затем читает его построчно
+    Opens and reads log file from path `log_filepath`
+    It can read both plain text or gzip archive types of logs
     """
     log_filetype, log_encoding = mimetypes.guess_type(log_filepath)
 
@@ -102,8 +98,8 @@ def read_log(log_filepath):
 
 def check_parse_errors(parsed_lines_count, parse_error_count, error_threshold):
     """
-    Определяет превышает ли количество ошибок парсинга некий порог.
-    Если да, то выдает False, что сигнализирует об остановке парсинга.
+    Checks whether parsing errors greater than `error_threshold`
+    If yes then returns `True` and stops parsing
     """
     try:
         errors_percent = parse_error_count / parsed_lines_count
@@ -143,24 +139,25 @@ def count_statistics(parsed_lines: list, report_size=500):
         0.0
     )
     result = []
-    for url, line in groupby(parsed_lines, key=itemgetter('request_url')):
+    sorted_lines = sorted(parsed_lines, key=itemgetter('request_url'))
+    for url, line in groupby(sorted_lines, key=itemgetter('request_url')):
         items = list(line)
         lines_count = len(items)
         url_request_time_list = [float(line.get('request_time', 0.0)) 
                                  for line in items]
-        time_sum = sum(url_request_time_list)
+        time_sum = round(sum(url_request_time_list), 3)
         result.append({
             'url': url,
             'count': lines_count,
-            'count_perc': lines_count / total_lines_count,
+            'count_perc': round((lines_count / total_lines_count) * 100, 3),
             'time_sum': time_sum,
             'time_max': max(
                 items,
                 key=lambda line: float(line.get('request_time', 0.0))
             ).get('request_time', 0.0),
-            'time_avg': statistics.mean(url_request_time_list),
-            'time_med': statistics.median(url_request_time_list),
-            'time_perc': time_sum / total_request_time
+            'time_avg': round(statistics.mean(url_request_time_list), 3),
+            'time_med': round(statistics.median(url_request_time_list), 3),
+            'time_perc': round((time_sum / total_request_time) * 100, 3)
         })
     return sorted(result, key=itemgetter('time_avg'),
                   reverse=True)[:report_size]
@@ -200,8 +197,8 @@ def get_args():
 
 def get_config(config_filepath, default_config={}):
     """
-    Считывает json данные с конфигурационного файла, который
-    указан в `config_filepath`
+    Reads config file which was specified in `config_filepath`
+    and merges it with `DEFAULT_CONFIG` constant
     """
 
     with open(config_filepath) as config_file:
@@ -270,8 +267,7 @@ def main(log=None, config=None):
 
     logger.info('Generate and save report '
                 'in folder: %s', config['REPORT_DIR'])
-    template_report_fullpath = os.path.join(config['REPORT_DIR'],
-                                            config['REPORT_TMP_NAME'])
+    template_report_fullpath = os.path.join('.', config['REPORT_TMP_NAME'])
     generate_and_save_report(
         report_data=lines_statistics,
         template_report_fullpath=template_report_fullpath,
